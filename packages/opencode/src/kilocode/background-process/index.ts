@@ -25,6 +25,7 @@ import { chmod, mkdir, readFile, readdir, rm, stat } from "fs/promises"
 import { randomUUID } from "crypto"
 import { hostname } from "os"
 import { spawn, type ChildProcess } from "child_process"
+import { StringDecoder } from "string_decoder"
 import { Context, Effect, Layer, Schema, Types } from "effect"
 import net from "net"
 import path from "path"
@@ -38,6 +39,21 @@ export namespace BackgroundProcess {
   const STOP_MS = 23_000
   const READY_MS = 30_000
   const PUBLISH_MS = 500
+  // Minimum gap between two stdout-driven event wakes for the same process, so
+  // a chatty process cannot flood the owning session with synthetic turns.
+  const WAKE_COOLDOWN_MS = 1_000
+  // Bounded capacity of the per-process pending wake-event queue. Overflow is
+  // observable (a warning is logged) and drops the OLDEST pending event so the
+  // newest, most actionable events (e.g. `exit`) survive.
+  const WAKE_QUEUE_MAX = 64
+  // Bounded retry attempts before a wake dispatch gives up and reports failure.
+  const WAKE_RETRY_MAX = 2
+  const WAKE_RETRY_DELAY_MS = 500
+  // Upper bound on a single in-progress wake line buffer (UTF-16 code units). A
+  // line longer than this (no newline) is dropped with a warning and the buffer
+  // enters drop-mode until the next newline, so a runaway process cannot grow
+  // memory unbounded and a truncated fragment is never mistaken for an event.
+  const WAKE_LINE_MAX = 64 * 1024
   // How long after `exit` a non-persistent process waits for its stdio pipes
   // to drain before finalizing, so a descendant holding them cannot keep it
   // non-terminal.
@@ -45,6 +61,93 @@ export namespace BackgroundProcess {
   const PORT_START_MS = 500
   const PORT_MS = 5_000
   const PORT_LIMIT_MS = 30_000
+
+  // A wake event stream source. stdout and stderr are independent OS pipes with
+  // independent chunk boundaries, so they keep separate line buffers; the "log"
+  // stream is the pre-decoded text read from a persistent process's log file.
+  export type WakeStream = "stdout" | "stderr" | "log"
+
+  // Incremental, per-stream line reassembly for wake-event detection. It accepts
+  // decoded text (complete UTF-8 characters), buffers a trailing incomplete line
+  // across chunks, and emits complete lines (EOL stripped, both `\n` and
+  // `\r\n`, including cross-chunk CRLF) exactly once. An over-long line with no
+  // newline enters drop-mode: all data is discarded until the next newline and a
+  // warning is logged, so no truncated fragment is ever emitted as an event.
+  export class WakeLineBuffer {
+    private line = ""
+    private overflow = false
+    private closed = false
+    constructor(private readonly max: number = WAKE_LINE_MAX) {}
+
+    feed(text: string): string[] {
+      if (this.closed || !text) return []
+      let rest = text
+      const out: string[] = []
+      for (;;) {
+        if (this.overflow) {
+          const nl = rest.indexOf("\n")
+          if (nl < 0) return out
+          this.overflow = false
+          this.line = ""
+          rest = rest.slice(nl + 1)
+          if (!rest) return out
+        }
+        this.line += rest
+        const parts = this.line.split(/\r?\n/)
+        const pending = parts.pop() ?? ""
+        for (const complete of parts) {
+          if (complete.length === 0) continue
+          if (complete.length > this.max) {
+            log.warn("background process wake line exceeded buffer limit; dropping line", {
+              length: complete.length,
+              max: this.max,
+            })
+            continue
+          }
+          out.push(complete)
+        }
+        if (pending.length > this.max) {
+          log.warn("background process wake pending line exceeded buffer limit; dropping until next newline", {
+            length: pending.length,
+            max: this.max,
+          })
+          this.line = ""
+          this.overflow = true
+          return out
+        }
+        this.line = pending
+        return out
+      }
+    }
+
+    flush(): string[] {
+      if (this.closed) return []
+      this.closed = true
+      if (this.overflow) {
+        this.line = ""
+        this.overflow = false
+        return []
+      }
+      const parts = this.line.split(/\r?\n/)
+      const pending = parts.pop() ?? ""
+      const out: string[] = []
+      for (const complete of parts) {
+        if (complete.length === 0) continue
+        if (complete.length > this.max) {
+          log.warn("background process wake line exceeded buffer limit; dropping line", { length: complete.length, max: this.max })
+          continue
+        }
+        out.push(complete)
+      }
+      // A trailing lone `\r` (an incomplete CRLF at EOF) is stripped.
+      const final = pending.endsWith("\r") ? pending.slice(0, -1) : pending
+      if (final.length > 0 && final.length <= this.max) out.push(final)
+      else if (final.length > this.max)
+        log.warn("background process wake final line exceeded buffer limit; dropping", { length: final.length, max: this.max })
+      this.line = ""
+      return out
+    }
+  }
 
   const idSchema = Schema.String.annotate({ [ZodOverride]: z.string().startsWith("bgp") }).pipe(
     Schema.brand("BackgroundProcessID"),
@@ -81,6 +184,21 @@ export namespace BackgroundProcess {
     .pipe(withStatics((s) => ({ zod: zod(s) })))
   export type Ready = Types.DeepMutable<Schema.Schema.Type<typeof Ready>>
 
+  // A wake config turns the process into an event source: each new stdout line
+  // matching `pattern` surfaces a synthetic prompt to the owning session so the
+  // agent can react to incremental events (e.g. `impeccable live-poll --stream`)
+  // without a manual user prompt. Unlike `ready.pattern` (one-shot), it fires
+  // repeatedly, throttled by `WAKE_COOLDOWN_MS`.
+  export const Wake = Schema.Struct({
+    pattern: optionalOmitUndefined(Schema.String).annotate({
+      description:
+        "Regular expression matched against new stdout lines to wake the owning session with a synthetic prompt",
+    }),
+  })
+    .annotate({ identifier: "BackgroundProcessWake" })
+    .pipe(withStatics((s) => ({ zod: zod(s) })))
+  export type Wake = Types.DeepMutable<Schema.Schema.Type<typeof Wake>>
+
   export const Info = Schema.Struct({
     id: ID,
     sessionID: SessionID,
@@ -113,6 +231,7 @@ export namespace BackgroundProcess {
     }),
     description: optionalOmitUndefined(Schema.String).annotate({ description: "Short human readable process label" }),
     ready: optionalOmitUndefined(Ready),
+    wake: optionalOmitUndefined(Wake),
     lifetime: optionalOmitUndefined(Lifetime),
     parentID: optionalOmitUndefined(SessionID),
   })
@@ -153,6 +272,16 @@ export namespace BackgroundProcess {
     proc?: ChildProcess
     start: StartInput
     pattern?: RegExp
+    wakePattern?: RegExp
+    lastWakeAt?: number
+    wakeQueue?: string[]
+    wakeDispatching?: boolean
+    wakeTimer?: ReturnType<typeof setTimeout>
+    wakeRetries?: number
+    wakeFinal?: boolean
+    wakeDecoders?: { stdout?: StringDecoder; stderr?: StringDecoder }
+    wakeLines?: { stdout?: WakeLineBuffer; stderr?: WakeLineBuffer; log?: WakeLineBuffer }
+    wakeLinesFlushed?: boolean
     resolve?: (ready: boolean) => void
     notify?: ReturnType<typeof setTimeout>
     poll?: ReturnType<typeof setTimeout>
@@ -170,6 +299,78 @@ export namespace BackgroundProcess {
     saving?: Promise<void>
     forgetting?: Promise<void>
     disposed?: boolean
+  }
+
+  // --- Event wake seam -------------------------------------------------------
+  // The wake surfaces a synthetic prompt to the owning session when a tracked
+  // process emits a line matching its `wake.pattern`. The default delivery
+  // mirrors `wakeup/resume.ts`: it re-enters the instance context and forks a
+  // new SessionPrompt turn. The handler is overridable so tests can assert the
+  // wake fires without booting the full agent runtime.
+  export type WakeInput = {
+    ctx: InstanceContext
+    sessionID: SessionID
+    text: string
+    info: Info
+    events: string[]
+  }
+  export type WakeHandler = (input: WakeInput) => Promise<void>
+
+  async function defaultWakeHandler(input: WakeInput) {
+    const [{ AppRuntime }, { SessionPrompt }] = await Promise.all([
+      import("@/effect/app-runtime"),
+      import("@/session/prompt"),
+    ])
+    // Refuse to drop a turn on a paused session, matching wakeup resume.
+    const paused = await AppRuntime.runPromise(
+      SessionPrompt.Service.use((svc) => svc.paused(input.sessionID)),
+    ).catch(() => false)
+    if (paused) {
+      log.debug("background process event wake skipped: session is paused", {
+        id: input.info.id,
+        sessionID: input.sessionID,
+      })
+      return
+    }
+    // Fork the turn so the wake never blocks stdout processing.
+    await AppRuntime.runPromise(
+      SessionPrompt.Service.use((svc) =>
+        Effect.forkDetach(
+          svc
+            .prompt({
+              sessionID: input.sessionID,
+              parts: [
+                {
+                  type: "text",
+                  text: input.text,
+                  synthetic: true,
+                  metadata: { background: true, backgroundProcessID: input.info.id },
+                },
+              ],
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logError("background process event wake failed", {
+                  id: input.info.id,
+                  sessionID: input.sessionID,
+                  cause,
+                }),
+              ),
+            ),
+        ),
+      ),
+    )
+  }
+
+  let wakeHandler: WakeHandler = defaultWakeHandler
+
+  /** Test seam: override wake delivery. Returns a restore function. */
+  export function _setWakeHandler(handler: WakeHandler): () => void {
+    const previous = wakeHandler
+    wakeHandler = handler
+    return () => {
+      wakeHandler = previous
+    }
   }
 
   const Persisted = Schema.Struct({
@@ -492,12 +693,222 @@ export namespace BackgroundProcess {
     persist(active)
   }
 
-  function append(active: Active, chunk: string) {
+  function append(active: Active, chunk: string, stream: WakeStream = "log") {
     if (active.disposed) return
     active.info.output = clamp(active.info.output + chunk)
     active.info.time.updated = Date.now()
     if (active.pattern?.test(active.info.output)) ready(active)
+    if (active.wakePattern) scanWakeLines(active, chunk, stream)
     schedule(active)
+  }
+
+  // Reassemble wake event lines across stdout/stderr/log chunks. Each stream
+  // keeps its own WakeLineBuffer so an incomplete stdout line is never polluted
+  // by stderr content. Only complete lines (EOL stripped) are matched; the
+  // trailing incomplete line stays buffered until the next chunk (or the final
+  // flush). The cooldown/queue below control delivery, never line detection.
+  function scanWakeLines(active: Active, text: string, stream: WakeStream) {
+    if (!active.wakePattern || terminal(active.info.status)) return
+    if (!text) return
+    if (!active.wakeLines) active.wakeLines = { stdout: undefined, stderr: undefined, log: undefined }
+    if (!active.wakeLines[stream]) active.wakeLines[stream] = new WakeLineBuffer()
+    for (const line of active.wakeLines[stream]!.feed(text)) matchWakeLine(active, line)
+  }
+
+  function matchWakeLine(active: Active, line: string) {
+    if (line && active.wakePattern?.test(line)) enqueueWake(active, line)
+  }
+
+  // Bounded FIFO enqueue. Overflow drops the oldest pending event (newest, most
+  // actionable events survive) and is logged so it is never silent.
+  function enqueueWake(active: Active, line: string) {
+    if (!active.wakeQueue) active.wakeQueue = []
+    if (active.wakeQueue.length >= WAKE_QUEUE_MAX) {
+      // The queue is at capacity (length > 0), so shift() always returns a value here.
+      const dropped = active.wakeQueue.shift()
+      if (dropped !== undefined) {
+        log.warn("background process wake queue overflow; dropping oldest event", {
+          id: active.info.id,
+          dropped,
+          queueSize: active.wakeQueue.length,
+        })
+      }
+    }
+    active.wakeQueue.push(line)
+    scheduleWakeDispatch(active)
+  }
+
+  // Decide WHEN to dispatch, applying the cooldown. Only one outstanding timer
+  // per process; events arriving while a dispatch is in flight stay queued and
+  // are picked up by the post-dispatch re-check.
+  function scheduleWakeDispatch(active: Active) {
+    if (active.disposed) return
+    if (active.wakeDispatching) return
+    if (!active.wakeQueue || active.wakeQueue.length === 0) return
+    if (active.wakeTimer) return
+    // A final flush (process exiting) bypasses the cooldown and dispatches as final.
+    if (active.wakeFinal) {
+      void dispatchWake(active, { final: true })
+      return
+    }
+    const now = Date.now()
+    if (!active.lastWakeAt || now - active.lastWakeAt >= WAKE_COOLDOWN_MS) {
+      void dispatchWake(active)
+      return
+    }
+    const delay = WAKE_COOLDOWN_MS - (now - active.lastWakeAt)
+    active.wakeTimer = setTimeout(() => {
+      active.wakeTimer = undefined
+      void dispatchWake(active)
+    }, Math.max(0, delay))
+  }
+
+  // Single-flight dispatch: processes one batch (all currently pending events)
+  // per invocation, preserving order. On handler failure, re-enqueues the batch
+  // and retries up to WAKE_RETRY_MAX; beyond that, logs the undelivered events
+  // and drops them (explicit failure reporting, not silent loss).
+  async function dispatchWake(active: Active, opts?: { final?: boolean }) {
+    const isFinal = opts?.final === true
+    if (!isFinal && active.disposed) return
+    if (active.wakeDispatching) return
+    if (!active.wakeQueue || active.wakeQueue.length === 0) return
+    active.wakeDispatching = true
+    let ok = false
+    let batch: string[] = []
+    try {
+      batch = active.wakeQueue.splice(0)
+      if (!isFinal) active.lastWakeAt = Date.now()
+      ok = await fireWakeBatch(active, batch, opts)
+    } catch (err) {
+      log.warn("background process event wake dispatch threw", {
+        err,
+        id: active.info.id,
+        sessionID: active.info.sessionID,
+      })
+      ok = false
+    } finally {
+      active.wakeDispatching = false
+    }
+    if (ok) {
+      active.wakeRetries = 0
+      // More events may have arrived during dispatch; re-arm under the cooldown.
+      if (active.wakeQueue.length > 0) scheduleWakeDispatch(active)
+      return
+    }
+    // Failure: restore the batch to the front (preserve order) and retry or report.
+    active.wakeQueue.unshift(...batch)
+    if (isFinal || active.wakeFinal) {
+      const dropped = active.wakeQueue.splice(0)
+      log.error("background process final event wake failed; dropping events", {
+        id: active.info.id,
+        sessionID: active.info.sessionID,
+        dropped,
+      })
+      active.wakeFinal = false
+      return
+    }
+    active.wakeRetries = (active.wakeRetries ?? 0) + 1
+    if (active.wakeRetries >= WAKE_RETRY_MAX) {
+      const dropped = active.wakeQueue.splice(0)
+      log.error("background process event wake permanently failed; dropping events", {
+        id: active.info.id,
+        sessionID: active.info.sessionID,
+        dropped,
+      })
+      active.wakeRetries = 0
+      return
+    }
+    if (active.wakeTimer) clearTimeout(active.wakeTimer)
+    active.wakeTimer = setTimeout(() => {
+      active.wakeTimer = undefined
+      void dispatchWake(active)
+    }, WAKE_RETRY_DELAY_MS)
+  }
+
+  async function fireWakeBatch(active: Active, lines: string[], opts?: { final?: boolean }): Promise<boolean> {
+    const isFinal = opts?.final === true
+    if (!isFinal && active.disposed) return false
+    const label = active.info.description ?? active.info.command
+    const text =
+      lines.length === 1
+        ? `[background process event] ${lines[0]}\n\n(From background process ${active.info.id}: ${label}. The process emitted a line matching the wake pattern. Review it and take the appropriate action for the event.)`
+        : `[background process event] ${lines.length} event(s) pending:\n\n${lines
+            .map((line, index) => `${index + 1}/${lines.length}: ${line}`)
+            .join("\n")}\n\n(From background process ${active.info.id}: ${label}. The process emitted ${lines.length} lines matching the wake pattern. Review them and take the appropriate action for each event, in order.)`
+    const input: WakeInput = {
+      ctx: active.ctx,
+      sessionID: active.info.sessionID,
+      text,
+      info: clone(active.info),
+      events: lines,
+    }
+    try {
+      await Instance.restore(active.ctx, () => wakeHandler(input))
+      return true
+    } catch (err) {
+      log.warn("background process event wake failed", {
+        err,
+        id: active.info.id,
+        sessionID: active.info.sessionID,
+      })
+      return false
+    }
+  }
+
+  // Decode a stdout/stderr Buffer chunk with a per-stream StringDecoder so a
+  // multi-byte UTF-8 character split across chunks is reconstructed instead of
+  // being replaced with U+FFFD. Non-wake processes skip the decoder entirely
+  // (no allocation, unchanged behavior) and fall back to `toString`.
+  function decodeWake(active: Active, stream: "stdout" | "stderr", chunk: Buffer): string {
+    if (!active.wakePattern) return chunk.toString("utf-8")
+    if (!active.wakeDecoders) active.wakeDecoders = {}
+    if (!active.wakeDecoders[stream]) active.wakeDecoders[stream] = new StringDecoder("utf-8")
+    return active.wakeDecoders[stream]!.write(chunk)
+  }
+
+  // Flush the per-stream line buffers and decoders ONCE, before the queue is
+  // delivered, so the final (newline-less) event line — notably the last
+  // `exit` — is enqueued and not lost. Idempotent via `wakeLinesFlushed`.
+  // Setting `wakeFinal` early ensures these terminal events dispatch via the
+  // final path (bypassing cooldown, failing fast) consistent with `flushWake`.
+  function flushWakeLines(active: Active) {
+    if (!active.wakePattern || active.wakeLinesFlushed) return
+    active.wakeLinesFlushed = true
+    active.wakeFinal = true
+    if (!active.wakeLines) active.wakeLines = { stdout: undefined, stderr: undefined, log: undefined }
+    // Drain any bytes the per-stream decoders still hold, so a final chunk or a
+    // split multi-byte char at the boundary is recovered before flushing lines.
+    for (const stream of ["stdout", "stderr"] as const) {
+      const decoder = active.wakeDecoders?.[stream]
+      if (!decoder) continue
+      const tail = decoder.end()
+      if (tail) {
+        active.info.output = clamp(active.info.output + tail)
+        if (!active.wakeLines[stream]) active.wakeLines[stream] = new WakeLineBuffer()
+        for (const line of active.wakeLines[stream]!.feed(tail)) matchWakeLine(active, line)
+      }
+    }
+    // Emit the trailing (no-newline) remainder of each stream as a final line.
+    for (const stream of ["stdout", "stderr", "log"] as const) {
+      const buf = active.wakeLines[stream]
+      if (!buf) continue
+      for (const line of buf.flush()) matchWakeLine(active, line)
+    }
+  }
+
+  // Final best-effort flush on process exit/stop so the last events (notably the
+  // `exit` line) are not lost merely because cleanup happened during cooldown.
+  // Bypasses the cooldown; if a dispatch is in flight, the post-dispatch re-check
+  // sees `wakeFinal` and runs a final dispatch.
+  function flushWake(active: Active) {
+    if (!active.wakePattern) return
+    if (active.wakeTimer) {
+      clearTimeout(active.wakeTimer)
+      active.wakeTimer = undefined
+    }
+    if (!active.wakeQueue || active.wakeQueue.length === 0) return
+    active.wakeFinal = true
+    if (!active.wakeDispatching) void dispatchWake(active, { final: true })
   }
 
   function exited(active: Active, code: number | null, signal: NodeJS.Signals | null) {
@@ -521,6 +932,13 @@ export namespace BackgroundProcess {
     active.resolve?.(false)
     active.resolve = undefined
     publish(active)
+    // Flush any wake line buffers (and decoder tails) so the final, possibly
+    // newline-less event — notably the last `exit` — is enqueued before the
+    // queue is delivered below. Must run before flushWake and only once.
+    flushWakeLines(active)
+    // Flush any wake events that arrived during cooldown before the process went
+    // terminal, so the final `exit`/`accept`/`steer` events are not lost.
+    flushWake(active)
   }
 
   function failed(active: Active, err: unknown) {
@@ -842,6 +1260,8 @@ export namespace BackgroundProcess {
     if (active.poll) clearTimeout(active.poll)
     if (active.watch) clearTimeout(active.watch)
     if (active.drain) clearTimeout(active.drain)
+    if (active.wakeTimer) clearTimeout(active.wakeTimer)
+    active.wakeTimer = undefined
     active.resolve?.(false)
     active.resolve = undefined
     if (active.info.lifetime === "persistent") await forget(state.shared, active)
@@ -879,7 +1299,7 @@ export namespace BackgroundProcess {
       })
     if (next === undefined) return
     active.offset = size
-    if (next) append(active, next)
+    if (next) append(active, next, "log")
   }
 
   function watch(shared: Shared, active: Active) {
@@ -948,6 +1368,7 @@ export namespace BackgroundProcess {
     const sh = Shell.acceptable()
     const cwd = path.resolve(state.dir, input.cwd ?? state.dir)
     const readyPattern = pattern(input.ready?.pattern)
+    const wakePattern = pattern(input.wake?.pattern)
     if (input.ready?.port && (await connected(input.ready.port))) {
       throw new Error(`Ready port is already in use: ${input.ready.port}`)
     }
@@ -1005,6 +1426,10 @@ export namespace BackgroundProcess {
       proc,
       start,
       pattern: readyPattern,
+      wakePattern,
+      wakeQueue: [],
+      wakeDispatching: false,
+      wakeRetries: 0,
       log: logpath,
       control,
       token,
@@ -1013,8 +1438,8 @@ export namespace BackgroundProcess {
     }
     const processes = owner(state, lifetime)
     processes.set(id, active)
-    proc.stdout?.on("data", (chunk) => append(active, chunk.toString("utf-8")))
-    proc.stderr?.on("data", (chunk) => append(active, chunk.toString("utf-8")))
+    proc.stdout?.on("data", (chunk) => append(active, decodeWake(active, "stdout", chunk), "stdout"))
+    proc.stderr?.on("data", (chunk) => append(active, decodeWake(active, "stderr", chunk), "stderr"))
     proc.once("error", (err) => failed(active, err))
     proc.once("exit", (code, signal) => {
       if (processes.get(id) !== active || active.disposed) return
@@ -1065,6 +1490,8 @@ export namespace BackgroundProcess {
       if (active.poll) clearTimeout(active.poll)
       if (active.watch) clearTimeout(active.watch)
       if (active.drain) clearTimeout(active.drain)
+      if (active.wakeTimer) clearTimeout(active.wakeTimer)
+      active.wakeTimer = undefined
       const stopped = await rollback(active).catch((cause) => {
         log.error("failed to roll back persistent process", { cause, id })
         return false
@@ -1129,6 +1556,10 @@ export namespace BackgroundProcess {
         info: record.info,
         start: record.start,
         pattern: pattern(record.start.ready?.pattern),
+        wakePattern: pattern(record.start.wake?.pattern),
+        wakeQueue: [],
+        wakeDispatching: false,
+        wakeRetries: 0,
         log: logfile(shared, record.info.id),
         control: controlfile(shared, record.info.id),
         token: record.token,
@@ -1203,6 +1634,8 @@ export namespace BackgroundProcess {
                 if (active.watch) clearTimeout(active.watch)
                 if (active.retry) clearTimeout(active.retry)
                 if (active.drain) clearTimeout(active.drain)
+                if (active.wakeTimer) clearTimeout(active.wakeTimer)
+                active.wakeTimer = undefined
                 active.proc?.removeAllListeners()
                 active.proc?.stdout?.destroy()
                 active.proc?.stderr?.destroy()

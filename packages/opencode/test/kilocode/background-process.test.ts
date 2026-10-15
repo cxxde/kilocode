@@ -656,6 +656,783 @@ setInterval(() => {}, 1_000)
     }),
   )
 
+  it.instance("wakes the owning session when a stdout line matches the wake pattern", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-event.mjs",
+          `console.log("ready")
+setTimeout(() => console.log('{"type":"generate","id":"evt-1"}'), 200)
+setInterval(() => {}, 1_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"generate"' },
+        }),
+      )
+      try {
+        yield* Effect.promise(() => until(() => wakes.length > 0, "wake was not triggered", 5_000))
+        expect(wakes[0].sessionID).toBe(sessionID)
+        expect(wakes[0].text).toContain('"type":"generate"')
+        expect(wakes[0].info.id).toBe(info.id)
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  it.instance("does not wake on output that does not match the wake pattern", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-no-match.mjs",
+          `console.log("ready")
+setTimeout(() => console.log("just noise"), 200)
+setInterval(() => {}, 1_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"generate"' },
+        }),
+      )
+      try {
+        // Give the non-matching line time to arrive and be processed.
+        yield* Effect.promise(() => Bun.sleep(600))
+        expect(wakes.length).toBe(0)
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  it.instance("preserves all wake matches within cooldown and delivers them in order", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-cooldown.mjs",
+          `console.log("ready")
+setTimeout(() => {
+  console.log('{"type":"generate","id":"a"}')
+  console.log('{"type":"generate","id":"b"}')
+}, 200)
+setInterval(() => {}, 1_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"generate"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(() => delivered().length >= 2, "both events were not delivered", 8_000),
+        )
+        // Both matching lines arrive well inside the 1s cooldown; none are dropped.
+        expect(delivered()).toEqual(['{"type":"generate","id":"a"}', '{"type":"generate","id":"b"}'])
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test A: multiple distinct events within cooldown are all delivered in order.
+  it.instance("delivers multiple events within cooldown in FIFO order", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-multi.mjs",
+          `console.log("ready")
+setTimeout(() => {
+  console.log('{"type":"generate","id":"e0"}')
+  setTimeout(() => console.log('{"type":"steer","id":"e1"}'), 100)
+  setTimeout(() => console.log('{"type":"accept","id":"e2"}'), 200)
+  setTimeout(() => console.log('{"type":"exit","id":"e3"}'), 300)
+}, 200)
+setInterval(() => {}, 5_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"(generate|steer|accept|exit)"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(() => delivered().length >= 4, "all four events were not delivered", 10_000),
+        )
+        expect(delivered()).toEqual([
+          '{"type":"generate","id":"e0"}',
+          '{"type":"steer","id":"e1"}',
+          '{"type":"accept","id":"e2"}',
+          '{"type":"exit","id":"e3"}',
+        ])
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test B: events arriving while a wake dispatch is in flight are preserved,
+  // and no overlapping dispatch loops run for the same process.
+  it.instance("preserves events arriving during an in-flight wake dispatch", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-concurrent.mjs",
+          `console.log("ready")
+setTimeout(() => {
+  console.log('{"type":"generate","id":"c0"}')
+  setTimeout(() => console.log('{"type":"steer","id":"c1"}'), 50)
+  setTimeout(() => console.log('{"type":"exit","id":"c2"}'), 100)
+}, 200)
+setInterval(() => {}, 5_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      let active = 0
+      let maxOverlap = 0
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        active++
+        maxOverlap = Math.max(maxOverlap, active)
+        wakes.push(input)
+        await Bun.sleep(300)
+        active--
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"(generate|steer|exit)"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(() => delivered().length >= 3, "all events were not delivered", 12_000),
+        )
+        expect(delivered()).toEqual([
+          '{"type":"generate","id":"c0"}',
+          '{"type":"steer","id":"c1"}',
+          '{"type":"exit","id":"c2"}',
+        ])
+        expect(maxOverlap).toBe(1)
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test C: an event arriving after the cooldown boundary is delivered without loss.
+  it.instance("delivers an event arriving after the cooldown boundary", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-boundary.mjs",
+          `console.log("ready")
+setTimeout(() => console.log('{"type":"generate","id":"b0"}'), 200)
+setTimeout(() => console.log('{"type":"exit","id":"b1"}'), 1_600)
+setInterval(() => {}, 5_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"(generate|exit)"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(() => delivered().length >= 1, "first event was not delivered", 5_000),
+        )
+        yield* Effect.promise(() =>
+          until(() => delivered().length >= 2, "second event was not delivered", 8_000),
+        )
+        expect(delivered()).toEqual(['{"type":"generate","id":"b0"}', '{"type":"exit","id":"b1"}'])
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test D: a pending event (notably the final exit) is flushed when the process
+  // is stopped during cooldown, instead of being silently lost.
+  it.instance("flushes pending wake events on process termination", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-exit-flush.mjs",
+          `console.log("ready")
+setTimeout(() => console.log('{"type":"generate","id":"d0"}'), 200)
+setTimeout(() => console.log('{"type":"exit","id":"d1"}'), 500)
+setInterval(() => {}, 5_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"(generate|exit)"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        // Wait for the first event to be dispatched (sets the cooldown).
+        yield* Effect.promise(() =>
+          until(() => delivered().some((e) => e.includes('"id":"d0"')), "first event not delivered", 5_000),
+        )
+        // Let the exit line arrive and be enqueued while still within cooldown.
+        yield* Effect.promise(() => Bun.sleep(500))
+        // Stop the process; flushWake should deliver the pending exit event.
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() =>
+          until(
+            () => delivered().some((e) => e.includes('"type":"exit"')),
+            "final exit event was not flushed on termination",
+            5_000,
+          ),
+        )
+        expect(delivered().some((e) => e.includes('"id":"d0"'))).toBe(true)
+        expect(delivered().some((e) => e.includes('"id":"d1"'))).toBe(true)
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test E: a rejecting wake handler does not cause an unhandled rejection, is
+  // retried a bounded number of times, then explicitly dropped so the queue is
+  // not stuck and later events still deliver.
+  it.instance("survives a rejecting wake handler without silent loss or stuck state", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-fail.mjs",
+          `console.log("ready")
+setTimeout(() => console.log('{"type":"generate","id":"f0"}'), 200)
+setTimeout(() => console.log('{"type":"exit","id":"f1"}'), 3_000)
+setInterval(() => {}, 8_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      let rejectCalls = 0
+      const rejectRestore = BackgroundProcess._setWakeHandler(async (input) => {
+        rejectCalls++
+        wakes.push(input)
+        throw new Error("simulated wake handler failure")
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"(generate|exit)"' },
+        }),
+      )
+      try {
+        // The failing event is retried at least once (bounded retry policy).
+        yield* Effect.promise(() =>
+          until(() => rejectCalls >= 2, "wake handler was not retried", 5_000),
+        )
+        // Wait past the retry delay so the drop completes and the queue drains.
+        yield* Effect.promise(() => Bun.sleep(800))
+        // No unhandled rejection: the test is still running. Swap to a healthy
+        // handler and verify a later event still delivers (queue not stuck).
+        rejectRestore()
+        const recovered: BackgroundProcess.WakeInput[] = []
+        const recoverRestore = BackgroundProcess._setWakeHandler(async (input) => {
+          recovered.push(input)
+        })
+        try {
+          const recoveredEvents = () => recovered.flatMap((w) => w.events)
+          yield* Effect.promise(() =>
+            until(
+              () => recoveredEvents().some((e) => e.includes('"id":"f1"')),
+              "later event was not delivered after handler recovery",
+              8_000,
+            ),
+          )
+          expect(recoveredEvents().some((e) => e.includes('"type":"exit"'))).toBe(true)
+        } finally {
+          recoverRestore()
+        }
+      } finally {
+        rejectRestore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test F: exceeding the queue capacity applies an observable overflow policy
+  // (drop oldest) without unbounded memory growth.
+  it.instance("drops oldest events on bounded queue overflow", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const total = 70
+      const lines = Array.from({ length: total }, (_, i) => `{"type":"generate","id":"q${i}"}`)
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-overflow.mjs",
+          `console.log("ready")
+const events = ${JSON.stringify(lines)}
+;(async () => {
+  for (const line of events) {
+    process.stdout.write(line + "\\n")
+    await new Promise((r) => setTimeout(r, 5))
+  }
+})()
+setInterval(() => {}, 8_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+        await gate
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"generate"' },
+        }),
+      )
+      try {
+        // Let all events enqueue while the first dispatch is blocked on the gate.
+        yield* Effect.promise(() => Bun.sleep(800))
+        release()
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(() => delivered().length >= 2, "overflow batches were not delivered", 8_000),
+        )
+        // Give the second (post-release) batch time to land.
+        yield* Effect.promise(() => Bun.sleep(500))
+        const got = delivered()
+        // The first event was dispatched immediately; the queue then capped at
+        // WAKE_QUEUE_MAX (64) dropping the oldest pending, so 5 events are lost.
+        expect(got.some((e) => e.includes('"id":"q0"'))).toBe(true)
+        expect(got.some((e) => e.includes('"id":"q6"'))).toBe(true)
+        expect(got.some((e) => e.includes('"id":"q69"'))).toBe(true)
+        // The dropped events are the oldest pending ones (q1..q5).
+        for (let i = 1; i <= 5; i++) {
+          expect(got.some((e) => e.includes(`"id":"q${i}"`))).toBe(false)
+        }
+        // No unbounded growth: delivered count is bounded.
+        expect(got.length).toBeLessThanOrEqual(total)
+        expect(got.length).toBeLessThan(total)
+      } finally {
+        release()
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // --- Cross-chunk line reassembly (incremental line buffering) -------------
+
+  describe("WakeLineBuffer", () => {
+    test("reassembles a single event split across two chunks", () => {
+      const buf = new BackgroundProcess.WakeLineBuffer()
+      expect(buf.feed('{"type":"gene')).toEqual([])
+      expect(buf.feed('rate","id":"evt-1"}\n')).toEqual(['{"type":"generate","id":"evt-1"}'])
+      expect(buf.flush()).toEqual([])
+    })
+
+    test("reassembles a single event split across four chunks", () => {
+      const buf = new BackgroundProcess.WakeLineBuffer()
+      expect(buf.feed('{"type":')).toEqual([])
+      expect(buf.feed('"gene')).toEqual([])
+      expect(buf.feed('rate",')).toEqual([])
+      expect(buf.feed('"id":"1"}\n')).toEqual(['{"type":"generate","id":"1"}'])
+      expect(buf.flush()).toEqual([])
+    })
+
+    test("emits multiple complete events in one chunk in order", () => {
+      const buf = new BackgroundProcess.WakeLineBuffer()
+      expect(
+        buf.feed('{"type":"generate","id":"1"}\n{"type":"steer","id":"2"}\n{"type":"accept","id":"3"}\n'),
+      ).toEqual(['{"type":"generate","id":"1"}', '{"type":"steer","id":"2"}', '{"type":"accept","id":"3"}'])
+    })
+
+    test("buffers an incomplete line until the next chunk completes it", () => {
+      const buf = new BackgroundProcess.WakeLineBuffer()
+      expect(buf.feed('{"type":"generate","id":"1"}\n{"type":"ste')).toEqual(['{"type":"generate","id":"1"}'])
+      expect(buf.feed('er","id":"2"}\n')).toEqual(['{"type":"steer","id":"2"}'])
+      expect(buf.flush()).toEqual([])
+    })
+
+    test("handles CRLF and cross-chunk CRLF without a trailing carriage return", () => {
+      const buf = new BackgroundProcess.WakeLineBuffer()
+      expect(buf.feed('{"type":"generate","id":"1"}\r\n')).toEqual(['{"type":"generate","id":"1"}'])
+      expect(buf.feed('{"type":"steer","id":"2"}\r')).toEqual([])
+      expect(buf.feed('\n')).toEqual(['{"type":"steer","id":"2"}'])
+    })
+
+    test("flush emits a trailing newline-less final line once", () => {
+      const buf = new BackgroundProcess.WakeLineBuffer()
+      expect(buf.feed('{"type":"exit","token":"abc"}')).toEqual([])
+      expect(buf.flush()).toEqual(['{"type":"exit","token":"abc"}'])
+      expect(buf.flush()).toEqual([])
+    })
+
+    test("drops an over-long line, enters drop-mode, and recovers after a newline", () => {
+      const buf = new BackgroundProcess.WakeLineBuffer(10)
+      expect(buf.feed("x".repeat(15))).toEqual([])
+      expect(buf.feed("more-no-newline-here")).toEqual([])
+      expect(buf.feed("x".repeat(15) + "\n")).toEqual([])
+      expect(buf.feed('\n{"a":1}\n')).toEqual(['{"a":1}'])
+      expect(buf.flush()).toEqual([])
+    })
+
+    test("does not emit empty lines", () => {
+      const buf = new BackgroundProcess.WakeLineBuffer()
+      expect(buf.feed("\n\n\n")).toEqual([])
+      expect(buf.flush()).toEqual([])
+    })
+  })
+
+  // Test A (integration): a split stdout event reaches enqueueWake via the data path.
+  it.instance("reassembles a stdout event split across two data chunks", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-split2.mjs",
+          `console.log("ready")
+const json = '{"type":"generate","id":"evt-1"}\\n'
+const buf = Buffer.from(json, "utf-8")
+const mid = Math.floor(buf.length / 2)
+process.stdout.write(buf.subarray(0, mid))
+setTimeout(() => process.stdout.write(buf.subarray(mid)), 50)
+setInterval(() => {}, 5_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"generate"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(() => delivered().includes('{"type":"generate","id":"evt-1"}'), "split event was not delivered", 8_000),
+        )
+        expect(delivered().length).toBe(1)
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test E (integration): stdout and stderr keep independent buffers.
+  it.instance("keeps stdout and stderr wake buffers independent", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-streams.mjs",
+          `console.log("ready")
+process.stdout.write('{"type":"gene')
+process.stderr.write('{"type":"log","src":"err"}\\n')
+setTimeout(() => process.stdout.write('rate","id":"1"}\\n'), 50)
+setInterval(() => {}, 5_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"(generate|log)"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(
+            () => delivered().includes('{"type":"generate","id":"1"}') && delivered().includes('{"type":"log","src":"err"}'),
+            "both stream events were not delivered",
+            8_000,
+          ),
+        )
+        expect(delivered().includes('{"type":"generate","id":"1"}')).toBe(true)
+        expect(delivered().includes('{"type":"log","src":"err"}')).toBe(true)
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test F (integration): the final newline-less event is flushed on exit.
+  it.instance("flushes the final newline-less stdout event on process exit", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-final.mjs",
+          `console.log("ready")
+process.stdout.write('{"type":"exit","token":"abc"}')
+setTimeout(() => {}, 200)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"exit"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(
+            () => delivered().some((e) => e.includes('"type":"exit"') && e.includes('"token":"abc"')),
+            "final newline-less event was not flushed on exit",
+            8_000,
+          ),
+        )
+        expect(delivered().length).toBe(1)
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test H (integration): a UTF-8 multi-byte char split at a byte boundary is recovered.
+  it.instance("recovers a UTF-8 multi-byte char split across chunks", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-utf8.mjs",
+          `console.log("ready")
+const json = '{"type":"steer","message":"修改页面布局"}\\n'
+const buf = Buffer.from(json, "utf-8")
+const prefix = '{"type":"steer","message":"'
+const splitAt = Buffer.byteLength(prefix, "utf-8") + 1
+process.stdout.write(buf.subarray(0, splitAt))
+setTimeout(() => process.stdout.write(buf.subarray(splitAt)), 50)
+setInterval(() => {}, 5_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+          wake: { pattern: '"type":"steer"' },
+        }),
+      )
+      try {
+        const delivered = () => wakes.flatMap((w) => w.events)
+        yield* Effect.promise(() =>
+          until(
+            () => delivered().some((e) => e.includes("修改页面布局")),
+            "UTF-8 event was not delivered intact",
+            8_000,
+          ),
+        )
+        const matched = delivered().find((e) => e.includes("修改页面布局"))!
+        expect(matched).toBe('{"type":"steer","message":"修改页面布局"}')
+        expect(matched.includes("\uFFFD")).toBe(false)
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
+  // Test J (integration): no wake configured -> no buffering/waking, output unchanged.
+  it.instance("does not buffer or wake when wake is not configured", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const sessionID = SessionID.descending()
+      const command = yield* Effect.promise(() =>
+        script(
+          test.directory,
+          "wake-none.mjs",
+          `console.log("ready")
+setTimeout(() => console.log('{"type":"generate","id":"x"}'), 200)
+setInterval(() => {}, 1_000)
+`,
+        ),
+      )
+      const wakes: BackgroundProcess.WakeInput[] = []
+      const restore = BackgroundProcess._setWakeHandler(async (input) => {
+        wakes.push(input)
+      })
+      const info = yield* Effect.promise(() =>
+        BackgroundProcess.start({
+          sessionID,
+          command,
+          cwd: test.directory,
+          ready: { pattern: "ready", timeout: 5_000 },
+        }),
+      )
+      try {
+        yield* Effect.promise(() => Bun.sleep(700))
+        expect(wakes.length).toBe(0)
+        const got = yield* Effect.promise(() => BackgroundProcess.get(info.id))
+        expect(got?.output).toContain('"type":"generate"')
+      } finally {
+        restore()
+        yield* Effect.promise(() => BackgroundProcess.stop(info.id))
+        yield* Effect.promise(() => BackgroundProcess.stopSession(sessionID))
+      }
+    }),
+  )
+
   it.instance("transfers inherited processes to the parent session", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
